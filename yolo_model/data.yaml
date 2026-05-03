@@ -1,0 +1,10 @@
+path: final_dataset
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: Bacterial_Blight
+  1: Rice_Blast
+  2: Brown_Spot
