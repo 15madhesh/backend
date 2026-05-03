@@ -94,17 +94,27 @@ def preprocess(img):
 
 
 def postprocess(outputs):
-    pred = outputs[0][0]  # shape: (25200, 8)
-    # filter by confidence
-    mask = pred[:, 4] > CONF_THR
-    pred = pred[mask]
+    pred = outputs[0][0]  # shape: (25200, 8)  → x,y,w,h, obj_conf, cls1, cls2, cls3
 
-    if len(pred) == 0:
+    # Compute final confidence = obj_conf * class_conf for each class
+    obj_conf   = pred[:, 4:5]                    # (25200, 1)
+    cls_scores = pred[:, 5:] * obj_conf          # (25200, 3)
+
+    # Best class per detection
+    cls_ids    = cls_scores.argmax(axis=1)       # (25200,)
+    cls_confs  = cls_scores.max(axis=1)          # (25200,)
+
+    # Filter by confidence threshold
+    mask = cls_confs > CONF_THR
+    cls_ids   = cls_ids[mask]
+    cls_confs = cls_confs[mask]
+
+    if len(cls_ids) == 0:
         return 'Healthy', 98, True
 
-    best_idx   = pred[:, 4].argmax()
-    cls_id     = int(pred[best_idx, 5])
-    confidence = round(float(pred[best_idx, 4]) * 100)
+    best_idx   = cls_confs.argmax()
+    cls_id     = int(cls_ids[best_idx])
+    confidence = round(float(cls_confs[best_idx]) * 100)
     label      = CLASSES[cls_id] if cls_id < len(CLASSES) else 'Healthy'
     return label, confidence, False
 
