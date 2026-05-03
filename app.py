@@ -1,11 +1,15 @@
-import os, sys, base64, io
+import os, base64, io
+import numpy as np
+import cv2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
+import onnxruntime as ort
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-WEIGHTS   = os.path.join(BASE_DIR, 'yolo_model', 'best.pt')
+WEIGHTS   = os.path.join(BASE_DIR, 'yolo_model', 'best.onnx')
 CONF_THR  = 0.25
+CLASSES   = ['Bacterial_Blight', 'Rice_Blast', 'Brown_Spot']
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -57,17 +61,15 @@ DISEASE_INFO = {
     }
 }
 
-print('Loading YOLO model .....')
-model = None
+print('Loading ONNX model .....')
+session = None
 
 try:
-    from ultralytics import YOLO
-    model = YOLO(WEIGHTS)
-    model.conf = CONF_THR
-    print("✅ Model loaded successfully (ultralytics)")
+    session = ort.InferenceSession(WEIGHTS, providers=['CPUExecutionProvider'])
+    print("✅ ONNX model loaded successfully")
 except Exception as e:
     print(f"❌ Model loading failed: {e}")
-    model = None
+    session = None
 
 
 def decode_b64(b64):
@@ -82,12 +84,34 @@ def encode_image(img):
     return base64.b64encode(buffered.getvalue()).decode()
 
 
+def preprocess(img):
+    img_np = np.array(img)
+    img_resized = cv2.resize(img_np, (640, 640))
+    img_tensor = img_resized.astype(np.float32) / 255.0
+    img_tensor = img_tensor.transpose(2, 0, 1)  # HWC to CHW
+    img_tensor = np.expand_dims(img_tensor, axis=0)
+    return img_tensor
+
+
+def postprocess(outputs):
+    pred = outputs[0][0]  # shape: (25200, 8)
+    # filter by confidence
+    mask = pred[:, 4] > CONF_THR
+    pred = pred[mask]
+
+    if len(pred) == 0:
+        return 'Healthy', 98, True
+
+    best_idx   = pred[:, 4].argmax()
+    cls_id     = int(pred[best_idx, 5])
+    confidence = round(float(pred[best_idx, 4]) * 100)
+    label      = CLASSES[cls_id] if cls_id < len(CLASSES) else 'Healthy'
+    return label, confidence, False
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        'status': 'ok',
-        'model_loaded': model is not None,
-    })
+    return jsonify({'status': 'ok', 'model_loaded': session is not None})
 
 
 @app.route('/')
@@ -97,11 +121,10 @@ def home():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if model is None:
+    if session is None:
         return jsonify({'error': 'Model not loaded'}), 500
 
     try:
-        # -------- IMAGE INPUT --------
         if request.is_json:
             data = request.get_json()
             if 'image' not in data:
@@ -112,30 +135,11 @@ def predict():
         else:
             return jsonify({'error': 'No image provided'}), 400
 
-        # -------- PREDICTION (ultralytics API) --------
-        results = model(img, imgsz=640)
-        result  = results[0]
-        boxes   = result.boxes
+        img_tensor = preprocess(img)
+        input_name = session.get_inputs()[0].name
+        outputs    = session.run(None, {input_name: img_tensor})
 
-        if boxes is None or len(boxes) == 0:
-            label      = 'Healthy'
-            confidence = 98
-            is_healthy = True
-        else:
-            # Pick detection with highest confidence
-            confs = boxes.conf.cpu().numpy()
-            best_idx   = int(confs.argmax())
-            cls_id     = int(boxes.cls[best_idx].cpu().numpy())
-            label      = result.names[cls_id]
-            confidence = round(float(confs[best_idx]) * 100)
-            is_healthy = False
-
-        # -------- DRAW OUTPUT IMAGE --------
-        plotted    = result.plot()          # numpy BGR array
-        output_img = Image.fromarray(plotted[..., ::-1])  # BGR→RGB
-        img_base64 = encode_image(output_img)
-
-        # -------- INFO --------
+        label, confidence, is_healthy = postprocess(outputs)
         info = DISEASE_INFO.get(label, DISEASE_INFO['Healthy'])
 
         return jsonify({
@@ -146,7 +150,7 @@ def predict():
             'severity':    info['severity'],
             'description': info['description'],
             'treatment':   info['treatment'],
-            'image':       img_base64,
+            'image':       encode_image(img),
         })
 
     except Exception as e:
